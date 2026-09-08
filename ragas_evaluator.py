@@ -1,8 +1,8 @@
 """Stage-specific and complete RAGAS evaluation helpers."""
 
 from datasets import Dataset
-from langchain_groq import ChatGroq
-from ragas import evaluate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from ragas import aevaluate
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.llms import LangchainLLMWrapper
 from ragas.metrics import (
@@ -20,33 +20,17 @@ class RagasEvaluator:
         """Create one reusable judge LLM and embedding adapter."""
         # Reusing these wrappers prevents repeated model initialization for
         # the retrieval, generation, and complete evaluation stages.
-        chat_model = ChatGroq(
-            api_key=api_key,
+        chat_model = ChatGoogleGenerativeAI(
+            google_api_key=api_key,
             model=model,
-            temperature=0,
+            timeout=30,
+            max_retries=1,
         )
         self.llm = LangchainLLMWrapper(chat_model)
         self.embeddings = LangchainEmbeddingsWrapper(embedding_model)
 
-        # Groq permits one completion per request.
+        # One generated reverse-question limits judge calls and quota usage.
         answer_relevancy.strictness = 1
-
-    def evaluate_retrieval(self, question, retrieved_contexts, reference_answer):
-        """Measure context precision and recall immediately after retrieval."""
-        # This dataset intentionally has no generated answer because these
-        # metrics evaluate the vector/hybrid retrieval stage by itself.
-        dataset = Dataset.from_dict({
-            "question": [question],
-            "contexts": [retrieved_contexts],
-            "ground_truth": [reference_answer],
-        })
-        result = evaluate(
-            dataset=dataset,
-            metrics=[context_precision, context_recall],
-            llm=self.llm,
-            show_progress=False,
-        )
-        return result
 
     def build_generation_dataset(
         self, question, answer, retrieved_contexts, reference_answer
@@ -59,20 +43,9 @@ class RagasEvaluator:
             "ground_truth": [reference_answer],
         })
 
-    def evaluate_generation(self, dataset):
-        """Measure whether the LLM answer is grounded and question-relevant."""
-        result = evaluate(
-            dataset=dataset,
-            metrics=[faithfulness, answer_relevancy],
-            llm=self.llm,
-            embeddings=self.embeddings,
-            show_progress=False,
-        )
-        return result
-
-    def evaluate_full(self, dataset):
-        """Run all four metrics together after answer generation."""
-        result = evaluate(
+    async def evaluate_full(self, dataset):
+        """Asynchronously run all four metrics after answer generation."""
+        result = await aevaluate(
             dataset=dataset,
             metrics=[
                 context_precision,
@@ -85,3 +58,17 @@ class RagasEvaluator:
             show_progress=False,
         )
         return result
+
+    @staticmethod
+    def split_full_result(result):
+        """Create concise retrieval/generation views without rerunning metrics."""
+        row = result.to_pandas().iloc[0]
+        retrieval = {
+            "context_precision": row.get("context_precision"),
+            "context_recall": row.get("context_recall"),
+        }
+        generation = {
+            "faithfulness": row.get("faithfulness"),
+            "answer_relevancy": row.get("answer_relevancy"),
+        }
+        return retrieval, generation

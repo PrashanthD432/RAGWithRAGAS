@@ -1,6 +1,19 @@
-"""Grounded prompt construction and Groq answer generation."""
+"""Grounded answer generation through Gemini's Interactions API."""
 
-from groq import Groq
+from google import genai
+from google.genai.errors import ClientError
+
+
+class LLMRateLimitError(RuntimeError):
+    """Raised when Gemini has no remaining request or token capacity."""
+
+
+class LLMModelNotFoundError(RuntimeError):
+    """Raised when the configured Gemini model is unavailable."""
+
+
+class LLMConnectionError(RuntimeError):
+    """Raised when the Gemini service cannot be reached."""
 
 
 def build_context(retrieved_docs):
@@ -21,8 +34,12 @@ def build_context(retrieved_docs):
     )
 
 
-def generate_answer(api_key, model, question, retrieved_docs):
-    """Generate a deterministic answer constrained to retrieved evidence."""
+async def generate_answer(api_key, model, question, retrieved_docs):
+    """Asynchronously generate an answer constrained to retrieved evidence."""
+    # Avoid an unnecessary model call when retrieval rejects every document.
+    if not retrieved_docs:
+        return "I don't have enough information in the provided documents."
+
     # The generation model receives only the final reranked evidence, never the
     # complete document collection. This reduces noise and limits hallucination.
     context = build_context(retrieved_docs)
@@ -30,6 +47,8 @@ def generate_answer(api_key, model, question, retrieved_docs):
 You are a document question-answering assistant.
 
 Answer the question ONLY using the context below.
+Synthesize all relevant source chunks into one cohesive final answer. Do not
+write a separate answer for each source chunk and do not repeat information.
 Do not infer, invent, or add process steps that are not explicitly present.
 When a retrieved chunk contains "Exact flow from the diagram", reproduce its
 step names and order exactly. Do not replace that flow with related prose.
@@ -49,18 +68,36 @@ Question:
 
 Answer:
 """
-    # Bounded retries and timeout prevent requests from hanging indefinitely.
-    client = Groq(api_key=api_key, timeout=30.0, max_retries=2)
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You answer questions using only retrieved document context.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        # Deterministic generation is preferable for factual RAG evaluation.
-        temperature=0,
-    )
-    return response.choices[0].message.content
+    # Google recommends the Interactions API for Gemini 3.x. Using it directly
+    # also avoids the generate_content automatic-function-calling warning.
+    client = genai.Client(api_key=api_key)
+    try:
+        response = await client.aio.interactions.create(
+            model=model,
+            input=prompt,
+            timeout=30,
+        )
+    except ClientError as error:
+        status_code = getattr(error, "code", None)
+        detail = getattr(error, "message", str(error))
+        if status_code == 429:
+            raise LLMRateLimitError(
+                f"Gemini rate limit reached. {detail}"
+            ) from error
+        if status_code == 404:
+            raise LLMModelNotFoundError(
+                f"Gemini model '{model}' is unavailable. {detail}"
+            ) from error
+        raise
+    except Exception as error:
+        # The Interactions client currently exposes its connection exception
+        # from an internal module, so detect that stable exception name without
+        # coupling application code to a private import path.
+        if type(error).__name__ == "APIConnectionError":
+            raise LLMConnectionError(
+                "Could not connect to Gemini. Check internet, proxy, and firewall."
+            ) from error
+        raise
+    finally:
+        await client.aio.aclose()
+    return response.output_text or ""
